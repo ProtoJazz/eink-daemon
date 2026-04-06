@@ -1,0 +1,14 @@
+[package]
+name = "eink-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zbus = "5"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+ureq = "3"
+toml = "0.8"
