@@ -1,14 +1,22 @@
-use zbus::Connection;
-use zbus::proxy::Builder;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use tokio::sync::watch;
+use zbus::message::Body;
+use zbus::Connection;
+use zbus::proxy::Builder;
+
+// ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct Config {
     display: DisplayConfig,
     calendar: CalendarConfig,
+    #[serde(default)]
+    notifications: NotificationConfig,
 }
 
 #[derive(Deserialize)]
@@ -23,6 +31,47 @@ struct CalendarConfig {
     timezone: String,
 }
 
+#[derive(Deserialize)]
+struct NotificationConfig {
+    /// Path to log all received notifications for reference
+    #[serde(default = "default_log_path")]
+    log_path: String,
+    /// Filter mode: "blacklist" or "whitelist"
+    #[serde(default = "default_filter_mode")]
+    filter_mode: String,
+    /// Apps to exclude (blacklist mode) or include (whitelist mode).
+    /// Matched against both app_name and desktop-entry hint.
+    #[serde(default)]
+    filter_apps: Vec<String>,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            log_path: default_log_path(),
+            filter_mode: default_filter_mode(),
+            filter_apps: Vec::new(),
+        }
+    }
+}
+
+fn default_log_path() -> String {
+    "~/.local/share/eink-daemon/notifications.log".to_string()
+}
+
+fn default_filter_mode() -> String {
+    "blacklist".to_string()
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let home = std::env::var("HOME")?;
     let config_path = format!("{}/.config/eink-daemon/config.toml", home);
@@ -30,6 +79,9 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let config: Config = toml::from_str(&content)?;
     Ok(config)
 }
+
+// ── Calendar ────────────────────────────────────────────────────────────────
+
 struct CalendarEvent {
     summary: String,
     start: chrono::DateTime<Tz>,
@@ -101,13 +153,179 @@ fn format_countdown(minutes: i64) -> String {
         }
     }
 }
+
+// ── Notifications ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct Notification {
+    app_name: String,
+    desktop_entry: String,
+    summary: String,
+    body: String,
+}
+
+impl Notification {
+    /// Returns the best identifier for this app — desktop_entry if available, else app_name
+    fn app_id(&self) -> &str {
+        if !self.desktop_entry.is_empty() {
+            &self.desktop_entry
+        } else {
+            &self.app_name
+        }
+    }
+
+    /// Check if this notification matches any entry in the given app list.
+    /// Matches against both app_name and desktop_entry.
+    fn matches_filter(&self, apps: &[String]) -> bool {
+        apps.iter().any(|filter| {
+            filter.eq_ignore_ascii_case(&self.app_name)
+                || filter.eq_ignore_ascii_case(&self.desktop_entry)
+        })
+    }
+}
+
+fn log_notification(log_path: &PathBuf, notif: &Notification) {
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let line = format!(
+        "[{}] app_name=\"{}\" desktop_entry=\"{}\" summary=\"{}\" body=\"{}\"\n",
+        timestamp, notif.app_name, notif.desktop_entry, notif.summary, notif.body,
+    );
+
+    match fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+        Err(e) => eprintln!("Failed to write notification log: {}", e),
+    }
+}
+
+/// Parse a Notify method call body into a Notification.
+/// D-Bus signature: (susssasa{sv}i)
+fn parse_notify_body(body: &Body) -> Option<Notification> {
+    // Deserialize the full Notify argument tuple.
+    // The image-data in hints can be complex, so we destructure manually via zbus's
+    // OwnedValue to avoid tripping on the giant image blobs.
+    let (app_name, _replaces_id, _app_icon, summary, body_text, _actions, hints, _expire): (
+        String,
+        u32,
+        String,
+        String,
+        String,
+        Vec<String>,
+        std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+        i32,
+    ) = body.deserialize().ok()?;
+
+    let desktop_entry = hints
+        .get("desktop-entry")
+        .and_then(|v| <String>::try_from(v.clone()).ok())
+        .unwrap_or_default();
+
+    Some(Notification {
+        app_name,
+        desktop_entry,
+        summary,
+        body: body_text,
+    })
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
-    let local_tz: Tz = config.calendar.timezone.parse()
+    let local_tz: Tz = config
+        .calendar
+        .timezone
+        .parse()
         .map_err(|_| format!("Invalid timezone: {}", config.calendar.timezone))?;
     let esp32_url = format!("http://{}:{}/", config.display.host, config.display.port);
 
+    let log_path = expand_tilde(&config.notifications.log_path);
+    let filter_mode = config.notifications.filter_mode.clone();
+    let filter_apps = config.notifications.filter_apps.clone();
+
+    // Channel to pass the latest notification from the monitor task to the main loop
+    let (notif_tx, notif_rx) = watch::channel::<Option<Notification>>(None);
+
+    // ── Notification monitor task ───────────────────────────────────────
+    let notif_connection = Connection::session().await?;
+
+    // Add a match rule to eavesdrop on Notify calls.
+    // Use BecomeMonitor to eavesdrop on Notify calls (same mechanism as dbus-monitor).
+    let match_rule = "type='method_call',interface='org.freedesktop.Notifications',member='Notify'";
+    let dbus_proxy: zbus::Proxy = Builder::new(&notif_connection)
+        .destination("org.freedesktop.DBus")?
+        .path("/org/freedesktop/DBus")?
+        .interface("org.freedesktop.DBus.Monitoring")?
+        .build()
+        .await?;
+    // BecomeMonitor(rules: Vec<String>, flags: u32)
+    dbus_proxy
+        .call::<_, _, ()>("BecomeMonitor", &(vec![match_rule], 0u32))
+        .await?;
+
+    use futures_util::StreamExt;
+    let mut stream = zbus::MessageStream::from(&notif_connection);
+
+    let log_path_clone = log_path.clone();
+    let filter_mode_clone = filter_mode.clone();
+    let filter_apps_clone = filter_apps.clone();
+
+    tokio::spawn(async move {
+        println!("[notif] monitor task started, waiting for messages...");
+        while let Some(Ok(msg)) = stream.next().await {
+            let header = msg.header();
+            let member = header.member().map(|m| m.as_str().to_string());
+            let iface = header.interface().map(|i| i.as_str().to_string());
+            let msg_type = header.message_type();
+            eprintln!(
+                "[notif] D-Bus message: type={:?} interface={:?} member={:?}",
+                msg_type, iface, member
+            );
+
+            // Only process method calls to Notify
+            if member.as_deref() != Some("Notify") {
+                continue;
+            }
+            if iface.as_deref() != Some("org.freedesktop.Notifications") {
+                continue;
+            }
+
+            eprintln!("[notif] Got a Notify call, attempting to parse body...");
+            let body = msg.body();
+            if let Some(notif) = parse_notify_body(&body) {
+                // Always log for reference
+                log_notification(&log_path_clone, &notif);
+
+                // Apply filter
+                let dominated = notif.matches_filter(&filter_apps_clone);
+                let pass = match filter_mode_clone.as_str() {
+                    "whitelist" => dominated,
+                    _ => !dominated, // blacklist: pass if NOT in list
+                };
+
+                if pass {
+                    println!(
+                        "[notif] {} | {} | {}",
+                        notif.app_id(),
+                        notif.summary,
+                        notif.body
+                    );
+                    let _ = notif_tx.send(Some(notif));
+                } else {
+                    println!("[notif] FILTERED: {} | {}", notif.app_id(), notif.summary);
+                }
+            } else {
+                eprintln!("[notif] Failed to parse Notify body");
+            }
+        }
+        eprintln!("[notif] monitor task ended unexpectedly");
+    });
+
+    // ── Calendar + display loop ─────────────────────────────────────────
     let connection = Connection::session().await?;
 
     let factory: zbus::Proxy = Builder::new(&connection)
@@ -128,7 +346,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    println!("eink-daemon started, polling every 30s");
+    println!("eink-daemon started, polling every 60s");
+    println!(
+        "notification filter: mode={}, apps={:?}",
+        filter_mode, filter_apps
+    );
 
     loop {
         let now = Utc::now();
@@ -139,9 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tomorrow.format("%Y%m%dT%H%M%SZ"),
         );
 
-        let events: Vec<String> = calendar
-            .call("GetObjectList", &(query.as_str(),))
-            .await?;
+        let events: Vec<String> = calendar.call("GetObjectList", &(query.as_str(),)).await?;
 
         let now_local = now.with_timezone(&local_tz);
         let today = now_local.date_naive();
@@ -177,33 +397,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let local_start = next.start.with_timezone(&local_tz);
             let local_end = next.end.with_timezone(&local_tz);
             let minutes_until = (local_start - now_local).num_minutes();
-            eprintln!("DEBUG: now_local = {:?}", now_local);
-            eprintln!("DEBUG: local_start = {:?}", local_start);
-            eprintln!("DEBUG: diff minutes = {}", (local_start - now_local).num_minutes());
             (
                 next.summary.clone(),
-                format!("{}-{}", local_start.format("%-H:%M"), local_end.format("%-H:%M")),
+                format!(
+                    "{}-{}",
+                    local_start.format("%-H:%M"),
+                    local_end.format("%-H:%M")
+                ),
                 format_countdown(minutes_until),
             )
         } else {
-            ("No upcoming events".to_string(), String::new(), String::new())
+            (
+                "No upcoming events".to_string(),
+                String::new(),
+                String::new(),
+            )
+        };
+
+        // Get the latest notification (if any)
+        let (notif_app, notif_text) = match notif_rx.borrow().as_ref() {
+            Some(n) => (n.app_id().to_string(), n.summary.clone()),
+            None => (String::new(), String::new()),
         };
 
         let payload = serde_json::json!({
             "event_name": event_name,
             "event_time": event_time,
             "event_countdown": event_countdown,
-            "notif_app": "",
-            "notif_text": ""
+            "notif_app": notif_app,
+            "notif_text": notif_text,
         });
 
-        println!("[{}] {}", now_local.format("%H:%M:%S"), event_name);
+        println!("[{}] -> {}", now_local.format("%H:%M:%S"), payload);
 
         match ureq::post(&esp32_url)
             .header("Content-Type", "application/json")
             .send(payload.to_string().as_bytes())
         {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => eprintln!("Failed to reach ESP32: {}", e),
         }
 
