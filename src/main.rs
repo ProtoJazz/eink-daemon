@@ -1,14 +1,17 @@
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::sync::watch;
-use zbus::message::Body;
 use zbus::Connection;
+use zbus::interface;
+use zbus::message::Body;
+use zbus::object_server::SignalEmitter;
 use zbus::proxy::Builder;
-
+use zbus::zvariant::Value;
 // ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -80,6 +83,109 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
+struct TrayIcon;
+
+#[interface(name = "org.kde.StatusNotifierItem")]
+impl TrayIcon {
+    // This becomes a D-Bus property called "IconName"
+    #[zbus(property)]
+    fn icon_name(&self) -> &str {
+        "audio-subwoofer-symbolic"
+    }
+
+    #[zbus(property)]
+    fn category(&self) -> &str {
+        "SystemServices"
+    }
+
+    #[zbus(property)]
+    fn id(&self) -> &str {
+        "eink-daemon"
+    }
+
+    #[zbus(property)]
+    fn title(&self) -> &str {
+        "eink-daemon"
+    }
+
+    #[zbus(property)]
+    fn version(&self) -> u32 {
+        3
+    }
+
+    #[zbus(property)]
+    fn text_direction(&self) -> &str {
+        "ltr"
+    }
+
+    #[zbus(property)]
+    fn status(&self) -> &str {
+        "normal"
+    }
+    #[zbus(property)]
+    fn menu(&self) -> zbus::zvariant::ObjectPath<'_> {
+        zbus::zvariant::ObjectPath::try_from("/Menu").unwrap()
+    }
+    #[zbus(signal)]
+    async fn layout_updated(
+        ctx: &SignalEmitter<'_>,
+        revision: u32,
+        parent: i32,
+    ) -> zbus::Result<()>;
+    // This would become a callable D-Bus method called "Activate"
+    fn activate(&self, x: i32, y: i32) {
+        println!("Someone clicked the tray icon!");
+    }
+}
+
+struct TrayMenu;
+
+#[interface(name = "com.canonical.dbusmenu")]
+impl TrayMenu {
+    fn get_layout(
+        &self,
+        _parent_id: i32,
+        _recursion_depth: i32,
+        _property_names: Vec<String>,
+    ) -> (u32, (i32, HashMap<String, Value<'_>>, Vec<Value<'_>>)) {
+        let item1 = Value::from((
+            1u32,
+            HashMap::from([
+                ("label".to_string(), Value::from("eInk Display")),
+                ("enabled".to_string(), Value::from(false)),
+            ]),
+            Vec::<Value>::new(),
+        ));
+
+        let item2 = Value::from((
+            2u32,
+            HashMap::from([("type".to_string(), Value::from("separator"))]),
+            Vec::<Value>::new(),
+        ));
+
+        let item3 = Value::from((
+            3u32,
+            HashMap::from([("label".to_string(), Value::from("Quit"))]),
+            Vec::<Value>::new(),
+        ));
+
+        (
+            1u32, // revision
+            (
+                0i32,           // root id
+                HashMap::new(), // root properties
+                vec![item1, item2, item3],
+            ),
+        )
+    }
+
+    fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
+        if id == 3 && event_id == "clicked" {
+            println!("Quit clicked!");
+            std::process::exit(0);
+        }
+    }
+}
 // ── Calendar ────────────────────────────────────────────────────────────────
 
 struct CalendarEvent {
@@ -195,8 +301,14 @@ fn log_notification(log_path: &PathBuf, notif: &Notification) {
         timestamp, notif.app_name, notif.desktop_entry, notif.summary, notif.body,
     );
 
-    match fs::OpenOptions::new().create(true).append(true).open(log_path) {
-        Ok(mut f) => { let _ = f.write_all(line.as_bytes()); }
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(mut f) => {
+            let _ = f.write_all(line.as_bytes());
+        }
         Err(e) => eprintln!("Failed to write notification log: {}", e),
     }
 }
@@ -351,6 +463,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "notification filter: mode={}, apps={:?}",
         filter_mode, filter_apps
     );
+
+    connection
+        .object_server()
+        .at("/StatusNotifierItem", TrayIcon)
+        .await?;
+    connection.object_server().at("/Menu", TrayMenu).await?;
+
+    let watcher: zbus::Proxy = Builder::new(&connection)
+        .destination("org.kde.StatusNotifierWatcher")?
+        .path("/StatusNotifierWatcher")?
+        .interface("org.kde.StatusNotifierWatcher")?
+        .build()
+        .await?;
+
+    watcher
+        .call::<_, _, ()>(
+            "RegisterStatusNotifierItem",
+            &(connection.unique_name().unwrap().as_str(),),
+        )
+        .await?;
 
     loop {
         let now = Utc::now();
