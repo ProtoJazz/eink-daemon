@@ -288,6 +288,42 @@ impl Notification {
                 || filter.eq_ignore_ascii_case(&self.desktop_entry)
         })
     }
+    
+    fn display_name(&self) -> String {
+        // Step 1: prefer app_name, fall back to desktop_entry
+        let raw = if !self.app_name.is_empty() {
+            self.app_name.as_str()
+        } else if !self.desktop_entry.is_empty() {
+            self.desktop_entry.as_str()
+        } else {
+            return "Unknown".to_string()
+        };
+
+        // Step 2: extract the meaningful segment
+        let name = if raw.starts_with("com.") || raw.starts_with("org.") {
+            // Reverse-domain: com.spotify.Client → take second-to-last
+            let parts: Vec<&str> = raw.split('.').collect();
+            if parts.len() >= 3 {
+                parts[parts.len() - 2]
+            } else {
+                parts.last().unwrap_or(&raw)
+            }
+        } else if raw.contains('_') {
+            raw.split('_').last().unwrap_or(raw)
+        } else if raw.contains('.') {
+            raw.split('.').last().unwrap_or(raw)
+        } else {
+            raw
+        };
+
+        let mut chars = name.chars();
+        match chars.next() {
+            None => String::new(),
+            Some(first) => {
+                first.to_uppercase().to_string() + &chars.as_str().to_lowercase()
+            }
+        }
+    }
 }
 
 fn log_notification(log_path: &PathBuf, notif: &Notification) {
@@ -548,7 +584,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Get the latest notification (if any)
         let (notif_app, notif_text) = match notif_rx.borrow().as_ref() {
-            Some(n) => (n.app_id().to_string(), n.summary.clone()),
+            Some(n) => (n.display_name(), n.summary.clone()),
             None => (String::new(), String::new()),
         };
 
